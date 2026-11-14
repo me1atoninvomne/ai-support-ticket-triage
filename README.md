@@ -94,4 +94,4 @@ a dashboard of ticket categories per week, the same flow built in **Make** for c
 
 ---
 
-*Built with AI assistance (Claude) as a learning and portfolio project.*
+
