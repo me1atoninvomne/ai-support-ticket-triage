@@ -1,0 +1,263 @@
+{
+  "name": "AI Support Ticket Triage",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support-ticket",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "8f1d2c9a-0a51-4c3e-9b0e-1a2b3c4d5e01",
+      "name": "Support ticket webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "f3a9c1e2-7b64-4d2a-9c11-5e6f7a8b9c01"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== CONFIG — choose the LLM provider (any OpenAI-compatible API) =====\n// DeepSeek: baseUrl 'https://api.deepseek.com',                              model 'deepseek-chat'\n// Qwen:     baseUrl 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', model 'qwen-plus'\n// OpenAI:   baseUrl 'https://api.openai.com/v1',                             model 'gpt-4o-mini'\nconst CONFIG = { baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', temperature: 0 };\n\nconst SYSTEM_PROMPT = `You are a support-ticket triage assistant for an online grocery and household-goods shop.\n\nRead the customer message and return ONE JSON object and nothing else (no markdown, no explanation).\n\nJSON schema:\n{\n  \"category\": \"order_status\" | \"delivery_problem\" | \"refund_return\" | \"product_question\" | \"payment\" | \"complaint\" | \"other\",\n  \"priority\": \"high\" | \"medium\" | \"low\",\n  \"sentiment\": \"positive\" | \"neutral\" | \"negative\",\n  \"language\": \"<ISO 639-1 code of the customer's language, e.g. en, de, sk, uk>\",\n  \"summary\": \"<one sentence in English, max 20 words>\",\n  \"suggested_reply\": \"<short, polite first reply in the customer's language, max 60 words>\"\n}\n\nCategory rules:\n- order_status: where is my order, order confirmation, order changes before shipping\n- delivery_problem: late, missing, damaged or wrong items in a delivery\n- refund_return: wants money back, wants to return or exchange a product\n- product_question: ingredients, availability, sizes, how to use a product\n- payment: double charge, failed payment, invoice, payment methods\n- complaint: unhappy with service or staff, without a concrete order problem\n- other: anything else (job applications, partnerships, spam)\n\nPriority rules:\n- high: money taken but nothing received, double charge, damaged or unsafe product, health or allergy risk,\n  customer threatens to cancel / leave a bad review, or the message mentions an urgent deadline\n- medium: a concrete problem with an order that needs action, but no urgency signals\n- low: general questions and feedback\n\nReply rules:\n- Never promise a refund, compensation or a delivery date — say the team will check and get back.\n- Do not invent order numbers or facts that are not in the message.\n- If the message contains no order number but one is needed, politely ask for it.`;\n\n// Core logic of the triage workflow.\n// The same functions run in two places:\n//   1. inside the n8n \"Code\" nodes (scripts/build-workflow.js copies them into the workflow JSON)\n//   2. in unit tests (test/triage.test.js) and the evaluation script, using plain Node.js\n// Keeping the logic here means it can be tested without n8n.\n\nconst CATEGORIES = ['order_status', 'delivery_problem', 'refund_return', 'product_question', 'payment', 'complaint', 'other'];\nconst PRIORITIES = ['high', 'medium', 'low'];\nconst SENTIMENTS = ['positive', 'neutral', 'negative'];\nconst MAX_MESSAGE_LENGTH = 4000;\n\n/** Cleans the raw webhook body and gives every ticket an id and a timestamp. */\nfunction normalizeTicket(body, now) {\n  const b = body || {};\n  const message = String(b.message || '').trim();\n  if (!message) {\n    throw new Error('Ticket message is empty');\n  }\n  const receivedAt = (now || new Date()).toISOString();\n  return {\n    ticket_id: String(b.ticket_id || 'T-' + Date.parse(receivedAt).toString(36).toUpperCase()),\n    received_at: receivedAt,\n    customer_email: String(b.email || '').trim().toLowerCase(),\n    subject: String(b.subject || '').trim().slice(0, 200),\n    message: message.slice(0, MAX_MESSAGE_LENGTH),\n  };\n}\n\n/**\n * Builds a request body for any OpenAI-compatible Chat Completions API\n * (OpenAI, DeepSeek, Qwen / DashScope compatible mode, many local servers).\n */\nfunction buildChatRequest(ticket, systemPrompt, config) {\n  return {\n    model: config.model,\n    temperature: config.temperature,\n    response_format: { type: 'json_object' },\n    messages: [\n      { role: 'system', content: systemPrompt },\n      { role: 'user', content: 'Subject: ' + (ticket.subject || '(none)') + '\\n\\nMessage:\\n' + ticket.message },\n    ],\n  };\n}\n\n/** Gets the text answer from an OpenAI-style or Anthropic-style API response. */\nfunction extractContent(apiResponse) {\n  const r = apiResponse || {};\n  if (r.choices && r.choices[0] && r.choices[0].message) return String(r.choices[0].message.content || '');\n  if (Array.isArray(r.content) && r.content[0]) return String(r.content[0].text || '');\n  return '';\n}\n\n/**\n * Turns the model's text into a safe, validated object.\n * LLMs sometimes wrap JSON in ```code fences```, add text around it, or use values outside the schema.\n * Anything unexpected is replaced with a safe default and the ticket is flagged for human review.\n */\nfunction parseClassification(rawContent) {\n  const problems = [];\n  let data = {};\n  const text = String(rawContent || '').replace(/```(?:json)?/gi, '').trim();\n  const start = text.indexOf('{');\n  const end = text.lastIndexOf('}');\n  if (start === -1 || end <= start) {\n    problems.push('no JSON object in model output');\n  } else {\n    try {\n      data = JSON.parse(text.slice(start, end + 1));\n    } catch (e) {\n      problems.push('invalid JSON: ' + e.message);\n    }\n  }\n\n  const pick = (field, allowed, fallback) => {\n    const value = String(data[field] || '').toLowerCase().trim();\n    if (allowed.includes(value)) return value;\n    problems.push(field + ' \"' + value + '\" not allowed');\n    return fallback;\n  };\n\n  const result = {\n    category: pick('category', CATEGORIES, 'other'),\n    priority: pick('priority', PRIORITIES, 'medium'),\n    sentiment: pick('sentiment', SENTIMENTS, 'neutral'),\n    language: /^[a-z]{2}$/.test(String(data.language || '').toLowerCase()) ? String(data.language).toLowerCase() : 'unknown',\n    summary: String(data.summary || '').trim().slice(0, 300),\n    suggested_reply: String(data.suggested_reply || '').trim().slice(0, 1000),\n  };\n  if (!result.summary) problems.push('summary missing');\n  result.needs_human_review = problems.length > 0 || result.priority === 'high';\n  result.parse_problems = problems.join('; ');\n  return result;\n}\n\nreturn $input.all().map((item) => {\n  const ticket = normalizeTicket(item.json.body);\n  return {\n    json: {\n      ...ticket,\n      llm_url: CONFIG.baseUrl.replace(/\\/$/, '') + '/chat/completions',\n      chat_request: buildChatRequest(ticket, SYSTEM_PROMPT, CONFIG),\n    },\n  };\n});\n"
+      },
+      "id": "8f1d2c9a-0a51-4c3e-9b0e-1a2b3c4d5e02",
+      "name": "Normalize ticket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.llm_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.chat_request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "8f1d2c9a-0a51-4c3e-9b0e-1a2b3c4d5e03",
+      "name": "Classify with LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Core logic of the triage workflow.\n// The same functions run in two places:\n//   1. inside the n8n \"Code\" nodes (scripts/build-workflow.js copies them into the workflow JSON)\n//   2. in unit tests (test/triage.test.js) and the evaluation script, using plain Node.js\n// Keeping the logic here means it can be tested without n8n.\n\nconst CATEGORIES = ['order_status', 'delivery_problem', 'refund_return', 'product_question', 'payment', 'complaint', 'other'];\nconst PRIORITIES = ['high', 'medium', 'low'];\nconst SENTIMENTS = ['positive', 'neutral', 'negative'];\nconst MAX_MESSAGE_LENGTH = 4000;\n\n/** Cleans the raw webhook body and gives every ticket an id and a timestamp. */\nfunction normalizeTicket(body, now) {\n  const b = body || {};\n  const message = String(b.message || '').trim();\n  if (!message) {\n    throw new Error('Ticket message is empty');\n  }\n  const receivedAt = (now || new Date()).toISOString();\n  return {\n    ticket_id: String(b.ticket_id || 'T-' + Date.parse(receivedAt).toString(36).toUpperCase()),\n    received_at: receivedAt,\n    customer_email: String(b.email || '').trim().toLowerCase(),\n    subject: String(b.subject || '').trim().slice(0, 200),\n    message: message.slice(0, MAX_MESSAGE_LENGTH),\n  };\n}\n\n/**\n * Builds a request body for any OpenAI-compatible Chat Completions API\n * (OpenAI, DeepSeek, Qwen / DashScope compatible mode, many local servers).\n */\nfunction buildChatRequest(ticket, systemPrompt, config) {\n  return {\n    model: config.model,\n    temperature: config.temperature,\n    response_format: { type: 'json_object' },\n    messages: [\n      { role: 'system', content: systemPrompt },\n      { role: 'user', content: 'Subject: ' + (ticket.subject || '(none)') + '\\n\\nMessage:\\n' + ticket.message },\n    ],\n  };\n}\n\n/** Gets the text answer from an OpenAI-style or Anthropic-style API response. */\nfunction extractContent(apiResponse) {\n  const r = apiResponse || {};\n  if (r.choices && r.choices[0] && r.choices[0].message) return String(r.choices[0].message.content || '');\n  if (Array.isArray(r.content) && r.content[0]) return String(r.content[0].text || '');\n  return '';\n}\n\n/**\n * Turns the model's text into a safe, validated object.\n * LLMs sometimes wrap JSON in ```code fences```, add text around it, or use values outside the schema.\n * Anything unexpected is replaced with a safe default and the ticket is flagged for human review.\n */\nfunction parseClassification(rawContent) {\n  const problems = [];\n  let data = {};\n  const text = String(rawContent || '').replace(/```(?:json)?/gi, '').trim();\n  const start = text.indexOf('{');\n  const end = text.lastIndexOf('}');\n  if (start === -1 || end <= start) {\n    problems.push('no JSON object in model output');\n  } else {\n    try {\n      data = JSON.parse(text.slice(start, end + 1));\n    } catch (e) {\n      problems.push('invalid JSON: ' + e.message);\n    }\n  }\n\n  const pick = (field, allowed, fallback) => {\n    const value = String(data[field] || '').toLowerCase().trim();\n    if (allowed.includes(value)) return value;\n    problems.push(field + ' \"' + value + '\" not allowed');\n    return fallback;\n  };\n\n  const result = {\n    category: pick('category', CATEGORIES, 'other'),\n    priority: pick('priority', PRIORITIES, 'medium'),\n    sentiment: pick('sentiment', SENTIMENTS, 'neutral'),\n    language: /^[a-z]{2}$/.test(String(data.language || '').toLowerCase()) ? String(data.language).toLowerCase() : 'unknown',\n    summary: String(data.summary || '').trim().slice(0, 300),\n    suggested_reply: String(data.suggested_reply || '').trim().slice(0, 1000),\n  };\n  if (!result.summary) problems.push('summary missing');\n  result.needs_human_review = problems.length > 0 || result.priority === 'high';\n  result.parse_problems = problems.join('; ');\n  return result;\n}\n\n// Pair every LLM answer with the ticket it belongs to (same order).\nconst tickets = $('Normalize ticket').all();\nreturn $input.all().map((item, i) => {\n  const t = tickets[i].json;\n  const c = parseClassification(extractContent(item.json));\n  return {\n    json: {\n      ticket_id: t.ticket_id,\n      received_at: t.received_at,\n      customer_email: t.customer_email,\n      subject: t.subject,\n      category: c.category,\n      priority: c.priority,\n      sentiment: c.sentiment,\n      language: c.language,\n      summary: c.summary,\n      suggested_reply: c.suggested_reply,\n      needs_human_review: c.needs_human_review,\n      parse_problems: c.parse_problems,\n      message: t.message,\n    },\n  };\n});\n"
+      },
+      "id": "8f1d2c9a-0a51-4c3e-9b0e-1a2b3c4d5e04",
+      "name": "Parse AI answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Tickets",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "8f1d2c9a-0a51-4c3e-9b0e-1a2b3c4d5e05",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "2c6f0d7e-4a3b-4b8e-8f61-0c1d2e3f4a01",
+              "leftValue": "={{ $('Parse AI answer').item.json.priority }}",
+              "rightValue": "high",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8f1d2c9a-0a51-4c3e-9b0e-1a2b3c4d5e06",
+      "name": "Is urgent?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#support-urgent",
+          "mode": "name"
+        },
+        "text": "=URGENT ticket {{ $('Parse AI answer').item.json.ticket_id }} ({{ $('Parse AI answer').item.json.category }})\nFrom: {{ $('Parse AI answer').item.json.customer_email }}\nSummary: {{ $('Parse AI answer').item.json.summary }}",
+        "otherOptions": {}
+      },
+      "id": "8f1d2c9a-0a51-4c3e-9b0e-1a2b3c4d5e07",
+      "name": "Alert support team in Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, ticket_id: $('Parse AI answer').item.json.ticket_id, category: $('Parse AI answer').item.json.category, priority: $('Parse AI answer').item.json.priority, needs_human_review: $('Parse AI answer').item.json.needs_human_review }) }}",
+        "options": {}
+      },
+      "id": "8f1d2c9a-0a51-4c3e-9b0e-1a2b3c4d5e08",
+      "name": "Respond to sender",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1540,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Support ticket webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize ticket": {
+      "main": [
+        [
+          {
+            "node": "Classify with LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify with LLM": {
+      "main": [
+        [
+          {
+            "node": "Parse AI answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI answer": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Is urgent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is urgent?": {
+      "main": [
+        [
+          {
+            "node": "Alert support team in Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to sender",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert support team in Slack": {
+      "main": [
+        [
+          {
+            "node": "Respond to sender",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
